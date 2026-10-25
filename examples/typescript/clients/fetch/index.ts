@@ -8,6 +8,7 @@ import { UptoSvmScheme } from "@x402/svm/upto/client";
 import { privateKeyToAccount } from "viem/accounts";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import { base58 } from "@scure/base";
+import { expectationFromEnv, refusalReason } from "./expectation";
 
 config();
 
@@ -27,9 +28,11 @@ const url = `${baseURL}${endpointPath}`;
  *
  * Optional environment variables:
  * - EVM_RPC_URL: JSON-RPC endpoint for onchain reads (enables gas sponsoring extensions)
- * - EXPECTED_AMOUNT_ATOMIC: the most this client will pay for the resource, in the asset's atomic
- *   units ("10000" is $0.01 USDC). The server sets the price; this pins what you agreed to pay.
- * - EXPECTED_PAY_TO, EXPECTED_ASSET: refuse to sign for any other recipient or asset
+ * - EXPECTED_AMOUNT_ATOMIC: the most this client will pay for the resource, in the selected asset's
+ *   atomic units ("10000" is $0.01 USDC). A higher price is refused; a lower one signs.
+ * - EXPECTED_NETWORK: CAIP-2 network id (e.g. eip155:8453); required with the two below
+ * - EXPECTED_PAY_TO, EXPECTED_ASSET: refuse to sign for any other recipient or asset, compared by
+ *   the network's rules (EVM ignores letter case; Solana compares the decoded bytes)
  */
 async function main(): Promise<void> {
   if (!evmPrivateKey && !svmPrivateKey) {
@@ -43,23 +46,14 @@ async function main(): Promise<void> {
   });
 
   // A spend cap is a ceiling, not a price check: a server that asks ten times the usual price of a
-  // cheap resource stays under $1 and gets paid. Pin what you expect for this resource and refuse
-  // anything else before the payment is signed.
-  const expectedAmount = process.env.EXPECTED_AMOUNT_ATOMIC;
-  const expectedPayTo = process.env.EXPECTED_PAY_TO?.toLowerCase();
-  const expectedAsset = process.env.EXPECTED_ASSET?.toLowerCase();
-  client.onBeforePaymentCreation(async ({ selectedRequirements: r }) => {
-    if (expectedAmount && BigInt(r.amount) > BigInt(expectedAmount)) {
-      return {
-        abort: true,
-        reason: `asked ${r.amount} atomic units, expected at most ${expectedAmount}`,
-      };
-    }
-    if (expectedPayTo && r.payTo.toLowerCase() !== expectedPayTo) {
-      return { abort: true, reason: `payTo ${r.payTo} is not the expected recipient` };
-    }
-    if (expectedAsset && r.asset.toLowerCase() !== expectedAsset) {
-      return { abort: true, reason: `asset ${r.asset} is not the expected asset` };
+  // cheap resource stays under $1 and gets paid. Pin the most you will pay for this resource, and
+  // the network, recipient and asset you expect; a higher price or any other network, recipient or
+  // asset is refused before the payment is signed. A lower price signs.
+  const expected = expectationFromEnv(process.env);
+  client.onBeforePaymentCreation(async ({ selectedRequirements }) => {
+    const reason = refusalReason(selectedRequirements, expected);
+    if (reason) {
+      return { abort: true, reason };
     }
   });
   if (evmPrivateKey) {
